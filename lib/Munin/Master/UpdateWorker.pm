@@ -777,6 +777,12 @@ sub uw_handle_config {
 			next; # Handled
 		}
 
+		# Prevent plugins from trying to set rrd:* attrs
+		if ($arg2 =~ /^rrd:/) {
+			WARN "Invalid line: $line";
+			next;
+		}
+
 		# Adding the $field if not present.
 		# Using an array since, obviously, the order is important.
 		if (!exists($fields{$arg1})) {
