@@ -258,6 +258,7 @@ sub handle_request
 	} else {
 	    $graph_scale = 1;
 	}
+	$sth->finish();
 
 	DEBUG "graph_printf: $graph_printf";
 
