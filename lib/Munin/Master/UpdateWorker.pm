@@ -246,8 +246,8 @@ sub _db_url {
 	my ($self, $type, $id, $path, $p_type, $p_id) = @_;
 	my $dbh = $self->{dbh};
 
+	my $sth_g_url = $dbh->prepare_cached("SELECT path FROM url WHERE type = ? AND id = ?");
 	if ($p_type) {
-		my $sth_g_url = $dbh->prepare_cached("SELECT path FROM url WHERE type = ? AND id = ?");
 		$sth_g_url->execute($p_type, $p_id);
 		my ($p_path) = $sth_g_url->fetchrow_array();
 		$sth_g_url->finish();
@@ -256,11 +256,16 @@ sub _db_url {
 		$path = "$p_path/$path" if $p_path;
 	}
 
-	my $sth_u_url = $dbh->prepare_cached("UPDATE url SET path = ? WHERE type = ? AND id = ?");
-	my $nb_rows_affected = $sth_u_url->execute($path, $type, $id);
-	unless ($nb_rows_affected > 0) {
+	$sth_g_url->execute($type, $id);
+	my ($oldpath) = $sth_g_url->fetchrow_array();
+	$sth_g_url->finish();
+
+	if (!defined($oldpath)) {
 		my $sth_url = $dbh->prepare_cached('INSERT INTO url (type, id, path) VALUES (?, ?, ?)');
 		$sth_url->execute($type, $id, $path);
+	} elsif ($oldpath ne $path) {
+		my $sth_u_url = $dbh->prepare_cached("UPDATE url SET path = ? WHERE type = ? AND id = ?");
+		my $nb_rows_affected = $sth_u_url->execute($path, $type, $id);
 	}
 }
 
@@ -359,10 +364,13 @@ sub _db_service {
 		my $sth_service = $dbh->prepare_cached("INSERT INTO service (node_id, name) VALUES (?, ?)");
 		$sth_service->execute($node_id, $plugin);
 		$service_id = _get_last_insert_id($dbh, "service");
+
+		my $sth_servicecat = $dbh->prepare_cached("INSERT INTO service_categories (id, category) values (?, ?)");
+		$sth_servicecat->execute($service_id, $service_attr->{graph_category});
 	}
 
 	DEBUG "_db_service.service_id:$service_id";
-
+=begin
 	# Save the existing values
 	my (%service_attrs_old, %fields_old);
 	{
@@ -385,8 +393,8 @@ sub _db_service {
 		$sth_fields_attr->finish();
 	}
 
-	DEBUG "_db_service.%service_attrs_old:" . Dumper(\%service_attrs_old);
-	DEBUG "_db_service.%fields_old:" . Dumper(\%fields_old);
+	#DEBUG "_db_service.%service_attrs_old:" . Dumper(\%service_attrs_old);
+	#DEBUG "_db_service.%fields_old:" . Dumper(\%fields_old);
 
 	# Leave room for refresh
 	# XXX - we might only update DB with diff.
@@ -397,6 +405,52 @@ sub _db_service {
 		my $_service_value = $service_attr->{$attr};
 		$self->_db_service_attr($service_id, $attr, $_service_value);
 	}
+=cut
+
+	my $service_attrs_old = $self->_db_update_service_attr($service_id, $service_attr);
+
+	# Handle the service_category
+	{
+		my $category = $service_attr->{graph_category} || "other";
+
+		# delete if the category changed
+		my $sth_service_cat_del = $dbh->prepare_cached("DELETE FROM service_categories WHERE id = ? and category != ?");
+		my $rows = $sth_service_cat_del->execute($service_id, $category);
+
+		# Insert if prior category deleted
+		if ($rows && $rows ne '0E0') {
+			my $sth_service_cat = $dbh->prepare_cached("INSERT INTO service_categories (id, category) VALUES (?, ?)");
+			$sth_service_cat->execute($service_id, $category);
+		}
+	}
+
+	# Handle the fields
+
+
+	# Remove old ds and ds_attr rows that are not present in the current
+	# set of fields, and cleanup state
+	{
+		my $sth_ds = $dbh->prepare_cached("SELECT id, name from ds where service_id = ?");
+		my $sth_del_ds = $dbh->prepare_cached("DELETE FROM ds where id = ?");
+		my $sth_del_ds_attr = $dbh->prepare_cached("DELETE FROM ds_attr where id = ?");
+		my $sth_del_ds_state = $dbh->prepare_cached("DELETE FROM state where id = ? and type = 'ds'");
+		$sth_ds->execute($service_id);
+		while (my ($dsid, $dsname) = $sth_ds->fetchrow_array()) {
+			if (!exists($fields->{$dsname})) {
+				$sth_del_ds_attr->execute($dsid);
+				$sth_del_ds_state->execute($dsid);
+				$sth_del_ds->execute($dsid);
+			}
+		}
+	}
+
+	my %ds_ids;
+	for my $field_name (keys %$fields) {
+		my $_field_attrs = $fields->{$field_name};
+
+		my $ds_id = $self->_db_ds_update($service_id, $field_name, $_field_attrs);
+		$ds_ids{$field_name} = $ds_id;
+	}
 
 	# Update the ordering of fields
 	{
@@ -404,53 +458,19 @@ sub _db_service {
 		DEBUG "_db_service.graph_order: @graph_order";
 		my $ordr = 0;
 		for my $_name (@graph_order) {
-			my $sth_update_ordr = $dbh->prepare_cached("UPDATE ds SET ordr = ? WHERE ds.service_id = ? AND ds.name = ?");
-			$sth_update_ordr->execute($ordr, $service_id, $_name);
+			my $sth_update_ordr = $dbh->prepare_cached("UPDATE ds SET ordr = ? WHERE ds.service_id = ? AND ds.name = ? and ds.ordr != ?");
+			$sth_update_ordr->execute($ordr, $service_id, $_name, $ordr);
 			DEBUG "_db_service.update_order($ordr, $service_id, $_name)";
 			$ordr ++;
 		}
-	}
-
-	# Handle the service_category
-	{
-		my $category = $service_attr->{graph_category} || "other";
-
-		# XXX - might only INSERT IT IF NOT PRESENT
-		my $sth_service_cat_del = $dbh->prepare_cached("DELETE FROM service_categories WHERE id = ? and category = ?");
-		$sth_service_cat_del->execute($service_id, $category);
-
-		my $sth_service_cat = $dbh->prepare_cached("INSERT INTO service_categories (id, category) VALUES (?, ?)");
-		$sth_service_cat->execute($service_id, $category);
-	}
-
-	# Handle the fields
-
-	# Remove the ds_attr rows
-	{
-		my $sth_del_attr = $dbh->prepare_cached('DELETE FROM ds_attr WHERE id IN (SELECT id FROM ds WHERE service_id = ?)');
-		$sth_del_attr->execute($service_id);
-	}
-
-	my %ds_ids;
-	for my $field_name (keys %$fields) {
-		my $_field_attrs = $fields->{$field_name};
-
-
-		my $ds_id = $self->_db_ds_update($service_id, $field_name, $_field_attrs);
-		$ds_ids{$field_name} = $ds_id;
-	}
-
-	# Purge the ds that have no attributes, as they are not relevant anymore
-	{
-		my $sth_del_ds = $dbh->prepare_cached('DELETE FROM ds WHERE service_id = ? AND NOT EXISTS (SELECT * FROM ds_attr WHERE ds_attr.id = ds.id)');
-		$sth_del_ds->execute($service_id);
 	}
 
 	$self->_db_url("service", $service_id, $plugin, "node", $node_id);
 
 	DEBUG "_db_service() = $service_id";
 
-	return ($service_id, \%service_attrs_old, \%fields_old, \%ds_ids);
+	my %fields_old = ();
+	return ($service_id, $service_attrs_old, \%fields_old, \%ds_ids);
 }
 
 sub _db_service_attr {
@@ -483,14 +503,95 @@ sub _db_ds_update {
 		$ds_id = _get_last_insert_id($dbh, "ds");
 	}
 
-	# Reinsert the other rows
-	my $sth_ds_attr = $dbh->prepare_cached('INSERT INTO ds_attr (id, name, value) VALUES (?, ?, ?)');
-	for my $field_attr (keys %$attrs) {
-		my $_value = $attrs->{$field_attr};
-		$sth_ds_attr->execute($ds_id, $field_attr, $_value);
-	}
+	$self->_db_update_ds_attr($ds_id, $attrs);
 
 	return $ds_id;
+}
+
+sub _db_update_service_attr {
+	my ($self, $service_id, $newvalues) = @_;
+	my $dbh = $self->{dbh};
+
+	my $del_sth = $dbh->prepare_cached("DELETE FROM service_attr where id=? and name=?");
+	my $ins_sth = $dbh->prepare_cached("INSERT INTO service_attr (id, name, value) VALUES (?, ?, ?)");
+
+	my $sth_service_attrs = $dbh->prepare_cached("SELECT name, value FROM service_attr WHERE id = ?");
+	$sth_service_attrs->execute($service_id);
+
+	my %service_attrs_old = ();
+	while (my ($_name, $_value) = $sth_service_attrs->fetchrow_array()) {
+		$service_attrs_old{$_name} = $_value;
+	}
+	$sth_service_attrs->finish();
+	DEBUG "_db_service.service_attrs_old:" . Dumper(\%service_attrs_old);
+
+	$self->_db_attr_differential($service_id, \%service_attrs_old, $newvalues, $del_sth, $ins_sth);
+
+	return \%service_attrs_old;
+}
+
+# attrname is optional, and will filter the queried attr set from the database
+# to compare against the new values.  This is intended to be used to set
+# individual attr values
+sub _db_update_ds_attr {
+	my ($self, $ds_id, $newvalues, $attrname) = @_;
+	my $dbh = $self->{dbh};
+
+	my $del_sth = $dbh->prepare_cached("DELETE FROM ds_attr where id=? and name=?");
+	my $ins_sth = $dbh->prepare_cached("INSERT INTO ds_attr (id, name, value) VALUES (?, ?, ?)");
+
+	# Here, we pull either the requested single attribute, or any attribute
+	# that's not an internal rrd: attr. rrd: attrs are set in
+	# uw_handle_config
+	my $sth_ds_attrs;
+	if (defined($attrname)) {
+		$sth_ds_attrs = $dbh->prepare_cached("SELECT name, value FROM ds_attr WHERE id = ? and name = ?");
+		$sth_ds_attrs->execute($ds_id, $attrname);
+	} else {
+		$sth_ds_attrs = $dbh->prepare_cached("SELECT name, value FROM ds_attr WHERE id = ? and name not like 'rrd:%'");
+		$sth_ds_attrs->execute($ds_id);
+	}
+
+	my %ds_attrs_old = ();
+	while (my ($_name, $_value) = $sth_ds_attrs->fetchrow_array()) {
+		$ds_attrs_old{$_name} = $_value;
+	}
+	$sth_ds_attrs->finish();
+	DEBUG "_db_service.ds_attrs_old:" . Dumper(\%ds_attrs_old);
+
+	$self->_db_attr_differential($ds_id, \%ds_attrs_old, $newvalues, $del_sth, $ins_sth);
+
+	return \%ds_attrs_old;
+}
+
+
+# del_sth takes an id and the attr name as params
+# ins_sth takes id, name, and value as params
+sub _db_attr_differential {
+	my ($self, $id, $_oldvalues, $_newvalues, $del_sth, $ins_sth) = @_;
+
+	# Don't change originals
+	my $oldvalues = { %$_oldvalues };
+	my $newvalues = { %$_newvalues };
+
+	# Remove unchanged attributes from consideration
+	while (my ($name, $value) = each(%$newvalues)) {
+		if (exists($oldvalues->{$name}) && ($oldvalues->{$name} eq $value)) {
+			delete($oldvalues->{$name});
+			delete($newvalues->{$name});
+		}
+	}
+
+	# Remaining old values should be deleted
+	foreach my $name (keys(%$oldvalues)) {
+		DEBUG "_db_attr_differential Deleted attr ${id}.${name} = ". $oldvalues->{$name};
+		$del_sth->execute($id, $name);
+	}
+	# Remaining new values should be inserted
+	while (my ($name, $value) = each(%$newvalues)) {
+		DEBUG "_db_attr_differential Inserted attr ${id}.${name} = ${value}";
+		$ins_sth->execute($id, $name, $value);
+	}
 }
 
 sub _db_state_update {
@@ -512,6 +613,13 @@ sub _db_state_update {
 			                WHERE ds.name = '$field'" unless $ds_id;
 	$sth_ds->finish();
 
+	# Don't insert missing ds values
+	# Note, this means unconfigured ds values are lost, rather than
+	# kept with some default ds_attr values
+	if (!defined($ds_id)) {
+		return $ds_id;
+	}
+
 	# Update the state with the new values
 	my $sth_state_u = $dbh->prepare_cached("UPDATE state SET prev_epoch = last_epoch, prev_value = last_value, last_epoch = ?, last_value = ? WHERE id = ? AND type = ?");
 	my $rows_u = $sth_state_u->execute($when, $value, $ds_id, "ds");
@@ -519,6 +627,28 @@ sub _db_state_update {
 		# No line exists yet. Create It.
 		my $sth_state_i = $dbh->prepare_cached("INSERT INTO state (id, type) VALUES (?, ?)");
 		$sth_state_i->execute($ds_id, "ds");
+	}
+
+	return $ds_id;
+}
+
+sub _db_extinfo_update {
+	my ($self, $plugin, $field, $value) = @_;
+	my $dbh = $self->{dbh};
+	my $node_id = $self->{node_id};
+
+	my $sth_ds = $dbh->prepare_cached("
+		SELECT ds.id FROM ds
+		JOIN service s ON ds.service_id = s.id AND s.node_id = ? AND s.name = ?
+		WHERE ds.name = ?");
+	$sth_ds->execute($node_id, $plugin, $field);
+	my ($ds_id) = $sth_ds->fetchrow_array();
+	$sth_ds->finish();
+
+	if (defined($ds_id)) {
+		$self->_db_update_ds_attr($ds_id, { "extinfo", $value }, "extinfo");
+	} else {
+		WARN "extinfo for unknown field: '${plugin}.${field}'";
 	}
 
 	return $ds_id;
@@ -647,12 +777,15 @@ sub uw_handle_config {
 			next; # Handled
 		}
 
-		$fields{$arg1}{$arg2} = $value;
-
 		# Adding the $field if not present.
 		# Using an array since, obviously, the order is important.
-		push @field_order, $arg1;
+		if (!exists($fields{$arg1})) {
+			push @field_order, $arg1;
+		}
+
+		$fields{$arg1}{$arg2} = $value;
 	}
+	DEBUG "field_order: " . Dumper(\@field_order);
 
 	$$update_rate_ptr = $service_attr{"update_rate"} if $service_attr{"update_rate"};
 
@@ -660,7 +793,7 @@ sub uw_handle_config {
 	{
 		my @graph_order = split(/ /, $service_attr{"graph_order"} || "");
 		for my $field (@field_order) {
-			push @graph_order, $field unless grep { $field } @graph_order;
+			push (@graph_order, $field) unless grep { /^$field$/ } @graph_order;
 		}
 
 		$service_attr{"graph_order"} = join(" ", @graph_order);
@@ -668,6 +801,9 @@ sub uw_handle_config {
 
 	# Always provide a default graph_title
 	$service_attr{graph_title} = $plugin unless defined $service_attr{graph_title};
+
+	# Always have a default category
+	$service_attr{graph_category} = 'other' unless defined $service_attr{graph_category};
 
 	# Sync to database
 	# Create/Update the service
@@ -682,12 +818,9 @@ sub uw_handle_config {
 		my $first_epoch = time - (12 * 3600); # XXX - we should be able to have some delay in the past for spoolfetched plugins
 		my $rrd_file = $self->_create_rrd_file_if_needed($plugin, $ds_name, $ds_config, $first_epoch);
 
-		# Update the RRD file
-		# XXX - Should be handled in a stateful way, as now it is reconstructed every time
-		my $dbh = $self->{dbh};
-		my $sth_ds_attr = $dbh->prepare_cached('INSERT INTO ds_attr (id, name, value) VALUES (?, ?, ?)');
-		$sth_ds_attr->execute($ds_id, "rrd:file", $rrd_file);
-		$sth_ds_attr->execute($ds_id, "rrd:field", "42");
+		# Update the RRD file info for the ds
+		$self->_db_update_ds_attr($ds_id, { "rrd:file", $rrd_file }, "rrd:file");
+		$self->_db_update_ds_attr($ds_id, { "rrd:field", 42 }, "rrd:field");
 	}
 
 	# timestamp == 0 means "Nothing was updated". We only count on the
@@ -722,10 +855,15 @@ sub uw_handle_fetch {
 	# Process all the data in-order
 	for my $line (@$data) {
 		next if ($line =~ m/^#/); # Ignore lines with comments
-		next unless ($line =~ m{\A ([^\.]+)(?:\.(\S+))? \s+ ([\S:]+) }xms);
-		my ($field, $arg, $value) = ($1, $2, $3);
+		next unless ($line =~ m{\A ([^\.]+)(?:\.(\S+))? \s+ ([\S:]+)(.*) }xms);
+		my ($field, $arg, $value, $trail) = ($1, $2, $3, $4);
 		$arg = "" unless defined $arg;
-		if ($arg ne "value") {
+		if ($arg eq "extinfo") {
+			if ($trail ne '') { $value .= $trail; }
+			my $ds_id = $self->_db_extinfo_update($plugin, $field, $value);
+			DEBUG "[DEBUG] ds_id.extinfo($plugin, $field, $value) = $ds_id";
+			next;
+		} elsif ($arg ne "value") {
 			WARN "got '$line' but it should not be part of a fetch reply as (arg:$arg), ignoring.";
 			next;
 		}
