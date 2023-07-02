@@ -605,6 +605,7 @@ RENDERING:
 	}
 
 CLEANUP:
+	$dbh->disconnect() if $dbh;
 	$dbh = undef;
 }
 
@@ -821,7 +822,7 @@ sub _get_params_fields {
 
 	my $sth_ds = $dbh->prepare_cached("
 		SELECT ds.name, ds.warning, ds.critical,
-		a_g.value, a_l.value, a_t.value, a_w.value, a_c.value, a_i.value
+		a_g.value, a_l.value, a_t.value, a_w.value, a_c.value, a_i.value, a_e.value
 		FROM ds
 		LEFT JOIN ds_attr a_g ON ds.id = a_g.id AND a_g.name = 'graph'
 		LEFT JOIN ds_attr a_l ON ds.id = a_l.id AND a_l.name = 'label'
@@ -829,12 +830,13 @@ sub _get_params_fields {
 		LEFT JOIN ds_attr a_w ON ds.id = a_w.id AND a_w.name = 'warning'
 		LEFT JOIN ds_attr a_c ON ds.id = a_c.id AND a_c.name = 'critical'
 		LEFT JOIN ds_attr a_i ON ds.id = a_i.id AND a_i.name = 'info'
+		LEFT JOIN ds_attr a_e ON ds.id = a_e.id AND a_e.name = 'extinfo'
 		WHERE ds.service_id = ?
 		ORDER BY ds.id ASC");
 	$sth_ds->execute($service_id);
 
 	my @fields;
-	while (my ($_ds_name, $_ds_s_warn, $_ds_s_crit, $_ds_graph, $_ds_label, $_ds_type, $_ds_warn, $_ds_crit, $_ds_info) =
+	while (my ($_ds_name, $_ds_s_warn, $_ds_s_crit, $_ds_graph, $_ds_label, $_ds_type, $_ds_warn, $_ds_crit, $_ds_info, $_ds_extinfo) =
 			$sth_ds->fetchrow_array) {
 		next if $_ds_graph && $_ds_graph eq 'no';
 
@@ -850,6 +852,7 @@ sub _get_params_fields {
 			WARN => $_ds_warn,
 			CRIT => $_ds_crit,
 			INFO => $_ds_info,
+			EXTINFO => $_ds_extinfo,
 		};
 	}
 
