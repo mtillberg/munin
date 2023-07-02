@@ -763,6 +763,7 @@ sub handle_request
 	}
 
 CLEANUP:
+	$dbh->disconnect() if $dbh;
 	$dbh = undef;
 
 	my $ttot = Time::HiRes::time;

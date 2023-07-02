@@ -864,10 +864,10 @@ sub get_param
 	my ($param) = @_;
 
 	# Ok, now SQL is needed to go further
-        use DBI;
-	my $datafilename = $ENV{MUNIN_DBURL} || "$Munin::Common::Defaults::MUNIN_DBDIR/datafile.sqlite";
-	my $dbh = Munin::Master::Update::get_dbh();
+	my $dbh = Munin::Master::Update::get_dbh(1);
 	my ($value) = $dbh->selectrow_array("SELECT value FROM param WHERE name = ?", undef, ($param));
+	$dbh->disconnect();
+
 	return $value;
 }
 
